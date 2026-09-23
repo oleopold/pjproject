@@ -6751,14 +6751,18 @@ static pj_status_t pjsua_call_on_rx_reinvite(pjsip_inv_session *inv,
                     pjsip_tx_data_dec_ref(response);
                 PJ_PERROR(3, (THIS_FILE, status,
                               "Failed to create rejection response"));
-                return status;
+                pjsip_inv_terminate(inv, PJSIP_SC_INTERNAL_SERVER_ERROR,
+                                    PJ_TRUE);
+                return PJ_SUCCESS;
             }
 
             status = pjsip_inv_send_msg(inv, response);
             if (status != PJ_SUCCESS) {
                 PJ_PERROR(3, (THIS_FILE, status,
                               "Failed to send rejection response"));
-                return status;
+                pjsip_inv_terminate(inv, PJSIP_SC_INTERNAL_SERVER_ERROR,
+                                    PJ_TRUE);
+                return PJ_SUCCESS;
             }
 
             return PJ_SUCCESS;
@@ -8039,6 +8043,7 @@ static pj_bool_t pjsua_call_on_uac_tsx_terminate_session(
 static void pjsua_call_on_send_ack(pjsip_inv_session *inv,
                                    pjsip_rx_data *rdata)
 {
+    pj_bool_t skip_sending_ack = PJ_FALSE;
     pjsua_call *call = (pjsua_call*) inv->dlg->mod_data[pjsua_var.mod.id];
 
     if (!call) {
@@ -8048,7 +8053,6 @@ static void pjsua_call_on_send_ack(pjsip_inv_session *inv,
 
     pj_log_push_indent();
 
-    pj_bool_t skip_sending_ack = PJ_FALSE;
     if (pjsua_var.ua_cfg.cb.on_call_send_ack) {
         skip_sending_ack = (*pjsua_var.ua_cfg.cb.on_call_send_ack)(call->index, rdata);
     }
