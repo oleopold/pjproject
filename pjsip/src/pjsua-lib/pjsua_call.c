@@ -3214,16 +3214,22 @@ on_answer_call_med_tp_complete(pjsua_call_id call_id,
     if (call->async_call.med_ch_deinit) {
         pjsua_media_channel_deinit(call->index);
         call->med_ch_cb = NULL;
+        call->answer_sdp = NULL;
         PJSUA_UNLOCK();
         return PJ_SUCCESS;
     }
 
-    status = pjsua_media_channel_create_sdp(call_id,
-                                            call->async_call.dlg->pool,
-                                            NULL, &sdp, &sip_err_code);
-    if (status != PJ_SUCCESS) {
-        pjsua_perror(THIS_FILE, "Error creating SDP answer", status);
-        goto on_return;
+    if (call->answer_sdp) {
+        sdp = call->answer_sdp;
+        call->answer_sdp = NULL;
+    } else {
+        status = pjsua_media_channel_create_sdp(call_id,
+                                                call->async_call.dlg->pool,
+                                                NULL, &sdp, &sip_err_code);
+        if (status != PJ_SUCCESS) {
+            pjsua_perror(THIS_FILE, "Error creating SDP answer", status);
+            goto on_return;
+        }
     }
 
     status = pjsip_inv_set_local_sdp(call->inv, sdp);
@@ -3235,6 +3241,8 @@ on_answer_call_med_tp_complete(pjsua_call_id call_id,
 
 on_return:
     if (status != PJ_SUCCESS) {
+        call->answer_sdp = NULL;
+
         /* If the callback is called from pjsua_call_on_incoming(), the
          * invite's state is PJSIP_INV_STATE_NULL, so the invite session
          * will be terminated later, otherwise we end the session here.
@@ -3506,6 +3514,8 @@ pjsua_call_answer_with_sdp(pjsua_call_id call_id,
     pjmedia_sdp_neg *old_neg;
     pj_bool_t app_managed;
     pj_status_t status, cancel_status;
+    pjmedia_sdp_session *pending_sdp = NULL;
+    pj_status_t status;
 
     PJ_ASSERT_RETURN(call_id>=0 && call_id<(int)pjsua_var.ua_cfg.max_calls,
                      PJ_EINVAL);
@@ -3536,6 +3546,45 @@ pjsua_call_answer_with_sdp(pjsua_call_id call_id,
     } else {
         status = pjsip_inv_set_sdp_answer(inv, sdp);
     }
+
+    /* For an initial offerless INVITE, let answer2() initialize media before
+     * setting the supplied SDP offer.
+     */
+    if (code < 300 && sdp &&
+        (call->opt_inited || code == 183 || code / 100 == 2) &&
+        (!call->inv->neg ||
+         pjmedia_sdp_neg_get_state(call->inv->neg) ==
+                PJMEDIA_SDP_NEG_STATE_NULL))
+    {
+        if (call->answer_sdp) {
+            pjsip_dlg_dec_lock(dlg);
+            return PJ_EBUSY;
+        }
+
+        pending_sdp = pjmedia_sdp_session_clone(call->inv->pool, sdp);
+        if (!pending_sdp) {
+            pjsip_dlg_dec_lock(dlg);
+            return PJ_ENOMEM;
+        }
+        call->answer_sdp = pending_sdp;
+
+        pjsip_dlg_dec_lock(dlg);
+        status = pjsua_call_answer2(call_id, opt, code, reason, msg_data);
+        if (status != PJ_SUCCESS && status != PJ_EPENDING) {
+            pj_status_t lock_status;
+
+            lock_status = acquire_call("pjsua_call_answer_with_sdp()",
+                                        call_id, &call, &dlg);
+            if (lock_status == PJ_SUCCESS) {
+                if (call->answer_sdp == pending_sdp)
+                    call->answer_sdp = NULL;
+                pjsip_dlg_dec_lock(dlg);
+            }
+        }
+        return status;
+    }
+
+    status = pjsip_inv_set_local_sdp(call->inv, sdp);
 
     pjsip_dlg_dec_lock(dlg);
     
@@ -3588,10 +3637,10 @@ static pj_status_t call_inv_send_ack(pjsip_inv_session *inv,
     if (inv == NULL)
         return PJ_EINVAL;
 
-    if (inv->neg == NULL)
-        return PJMEDIA_SDPNEG_EINSTATE;
-
     if (sdp) {
+        if (inv->neg == NULL)
+            return PJMEDIA_SDPNEG_EINSTATE;
+    
         neg_state = pjmedia_sdp_neg_get_state(inv->neg);
         if (neg_state != PJMEDIA_SDP_NEG_STATE_REMOTE_OFFER &&
             neg_state != PJMEDIA_SDP_NEG_STATE_WAIT_NEGO)
@@ -3640,7 +3689,8 @@ PJ_DEF(pj_status_t) pjsua_call_send_ack(pjsua_call_id call_id,
     pj_log_push_indent();
 
     if (ack_callback_inv_tls != -1)
-        callback_inv = (pjsip_inv_session*) pj_thread_local_get(ack_callback_inv_tls);
+        callback_inv = (pjsip_inv_session*)
+                       pj_thread_local_get(ack_callback_inv_tls);
 
     if (callback_inv) {
         call = (pjsua_call*) callback_inv->dlg->mod_data[pjsua_var.mod.id];
@@ -8093,7 +8143,8 @@ static void pjsua_call_on_send_ack(pjsip_inv_session *inv,
     pj_log_push_indent();
 
     if (pjsua_var.ua_cfg.cb.on_call_send_ack) {
-        prev_inv = (pjsip_inv_session*) pj_thread_local_get(ack_callback_inv_tls);
+        prev_inv = (pjsip_inv_session*)
+                   pj_thread_local_get(ack_callback_inv_tls);
         status = pj_thread_local_set(ack_callback_inv_tls, inv);
         if (status == PJ_SUCCESS) {
             skip_sending_ack = (*pjsua_var.ua_cfg.cb.on_call_send_ack)(
